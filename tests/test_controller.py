@@ -1637,3 +1637,22 @@ class TestOnStatusMessage:
             mock_client.send_card_to_chat.assert_called_once()
         finally:
             loop.call_soon_threadsafe(loop.stop)
+
+
+class TestTryFinalizeByChat:
+    def test_returns_false_when_disabled(self) -> None:
+        import asyncio
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = False
+        result = asyncio.run(ctrl.try_finalize_by_chat(chat_id="c1", answer="hi"))
+        assert result is False
+
+    def test_returns_false_when_no_candidates(self) -> None:
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+        ctrl._sessions = {}
+        import asyncio
+        result = asyncio.run(ctrl.try_finalize_by_chat(chat_id="c1", answer="hi"))
+        assert result is False

@@ -122,6 +122,7 @@ def _complete_hook(indent: str) -> str:
             "            'api_calls': agent_result.get('api_calls', 0),",
             "            'max_iterations': agent_result.get('max_iterations', 0),",
             "        },",
+            "        chat_id=source.chat_id,",
             "    )",
             "    if _lark_card_sent:",
             "        agent_result['already_sent'] = True",

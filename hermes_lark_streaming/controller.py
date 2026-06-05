@@ -408,6 +408,53 @@ class StreamCardController(StreamingController):
 
         return await self._complete_session_wait(session)
 
+    async def try_finalize_by_chat(
+        self,
+        *,
+        chat_id: str,
+        answer: str = "",
+        duration: float = 0.0,
+        model: str = "",
+        tokens: dict | None = None,
+        context: dict | None = None,
+    ) -> bool:
+        """Fallback 路径: on_completed_wait 失败后, 找同 chat 最近可 finalize 的 session.
+
+        场景: event.message_id 无法定位 session（compaction 切走 / cleanup 已删 / 并发争用）,
+        但同 chat 有 _已成功发占位卡_ 的 session（_prune 之前）, 用 cardkit_update 追加 answer。
+
+        成功返回 True（已 patch 到原卡）；失败返回 False（gateway 走 text fallback 发 post）。
+        """
+        if not self.enabled or not chat_id:
+            return False
+        # 找同 chat 最近且 _有 card_id_ 的 session（说明占位卡已发成功）
+        candidates = [
+            s for s in self._sessions.values()
+            if s.chat_id == chat_id
+            and s.card_id
+            and not s.state.is_terminal
+        ]
+        if not candidates:
+            return False
+        # 选最近创建的
+        session = max(candidates, key=lambda s: s.created_at)
+        # 调 _complete_session_wait（它内部调 _do_complete_card）
+        if answer and session.segment_state and not any(
+            seg.type == SegmentType.ANSWER for seg in session.segment_state.segments
+        ):
+            final_answer = strip_reasoning_tags(answer)
+            if final_answer:
+                session.segment_state.on_answer_delta(final_answer)
+        session.footer = {
+            "duration": duration,
+            "model": model,
+            **({"input_tokens": tokens.get("input_tokens")} if tokens else {}),
+            **({"output_tokens": tokens.get("output_tokens")} if tokens else {}),
+            **({"context_used": context.get("used_tokens")} if context else {}),
+            **({"context_max": context.get("max_tokens")} if context else {}),
+        }
+        return await self._complete_session_wait(session)
+
     def on_cron_deliver(
         self,
         *,
