@@ -38,6 +38,15 @@ class StreamCardController(StreamingController):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._text_fallback_needed: set[str] = set()
         self._text_fallback_aliases: dict[str, set[str]] = {}
+        # 决策链耗尽/已终态后产生的 background review 消息：session 已无法承载，
+        # 按 chat_id 合并后通过 on_background_deliver 包装成独立卡片发送，避免裸文本刷屏。
+        self._completed_chat_for_message: dict[str, str] = {}
+        self._completed_chat_at: dict[str, float] = {}
+        self._orphan_review_queue: dict[str, list[str]] = {}
+        self._orphan_review_timers: dict[str, asyncio.TimerHandle] = {}
+        self._orphan_review_lock = threading.Lock()
+        self._orphan_chat_max_ttl_sec = 600.0  # 已完成 message_id→chat_id 映射的保留窗口
+        self._orphan_flush_delay_sec = 0.6  # 同一 chat_id 内的合并窗口
 
     @property
     def enabled(self) -> bool:
@@ -379,6 +388,15 @@ class StreamCardController(StreamingController):
             session.state,
         )
 
+        # 触顶场景: session 即将进入终态,但 hermes 不会自动 schedule background
+        # review(因为 nudge_interval=10 不满足)。主动入队一条 review 走合并卡片
+        # 路径,确保"决策链耗尽"事件以独立卡片形式呈现给用户,而不是裸文本警告。
+        self._enqueue_budget_exhausted_review(
+            session=session,
+            answer=answer,
+            context=context,
+        )
+
         self._apply_completion_payload(
             session=session,
             answer=answer,
@@ -411,6 +429,109 @@ class StreamCardController(StreamingController):
             _logger.warning("cron card delivery failed", exc_info=True)
             return False
 
+    def on_status_message(
+        self,
+        *,
+        chat_id: str,
+        event_type: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        """状态消息 (compaction/触顶/系统通知) — 推独立卡片.
+
+        对于 Compacting context / Iteration budget exhausted 类,会先强制
+        finalize 当前 chat 的 active session,让"截断自动整合面板"发生。
+        同步包装:调度到 gateway event loop,等 30s。
+        """
+        if not self.enabled or not chat_id or not content:
+            return False
+        loop = self._get_loop()
+        if loop is None:
+            return False
+        future = asyncio.run_coroutine_threadsafe(
+            self._do_status_message(
+                chat_id=chat_id,
+                event_type=event_type,
+                content=content,
+                metadata=metadata,
+            ),
+            loop,
+        )
+        try:
+            return bool(future.result(timeout=30))
+        except Exception:
+            _logger.warning("on_status_message failed: chat=%s type=%s",
+                            chat_id[:12], event_type, exc_info=True)
+            return False
+
+    async def _do_status_message(
+        self,
+        *,
+        chat_id: str,
+        event_type: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        """async 实际处理:compaction/budget 强制 finalize active session + 推独立卡片."""
+        is_compaction = "Compacting context" in content
+        is_budget = "Iteration budget exhausted" in content or content.startswith("⚠️")
+
+        # 截断事件:强制 finalize 当前 chat 的 active streaming 卡片
+        if is_compaction or is_budget:
+            active_sessions = [
+                s for s in self._sessions.values()
+                if s.chat_id == chat_id
+                and s.state in (SessionState.STREAMING, SessionState.ACTIVE)
+            ]
+            for session in active_sessions:
+                try:
+                    await self._do_complete_card(session)
+                    _logger.info(
+                        "on_status_message: finalized active session msg=%s due to %s",
+                        session.message_id[:12],
+                        "compaction" if is_compaction else "budget",
+                    )
+                except Exception as exc:
+                    _logger.warning(
+                        "on_status_message: finalize failed msg=%s: %s",
+                        session.message_id[:12], exc,
+                    )
+
+        # 发独立 status 卡片
+        try:
+            return await self._do_send_standalone_status_card(
+                chat_id=chat_id,
+                event_type=event_type,
+                content=content,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            _logger.warning("on_status_message: standalone card failed: %s", exc, exc_info=True)
+            return False
+
+    async def _do_send_standalone_status_card(
+        self,
+        *,
+        chat_id: str,
+        event_type: str,
+        content: str,
+        metadata: dict | None = None,
+    ) -> bool:
+        """推独立 status 卡片(不 reply to user message)."""
+        from .cardkit.builder import build_status_card
+        await self._ensure_init()
+        assert self._client is not None
+        card = build_status_card(event_type=event_type, content=content)
+        reply_to = (metadata or {}).get("reply_to_message_id")
+        await self._client.send_card_to_chat(
+            chat_id,
+            card,
+            reply_to_message_id=reply_to,
+        )
+        _logger.info("on_status_message: standalone card sent chat=%s type=%s len=%d",
+                     chat_id[:12], event_type, len(content))
+        return True
+
     async def on_background_deliver(
         self,
         *,
@@ -442,17 +563,164 @@ class StreamCardController(StreamingController):
         text: str,
         sender: Callable[[str], Any],
     ) -> bool:
-        """暂存 Hermes background review 通知，等卡片收尾后再发送."""
+        """暂存 Hermes background review 通知，等卡片收尾后再发送.
+
+        两条路径：
+        1. session 仍活跃 → 暂存到 session.deferred_background_reviews，
+           由 _flush_deferred_background_reviews 在卡片收尾时按 sender 发送。
+        2. session 不存在/已终态（典型：决策链耗尽 90/90 触发的 AI 总结，
+           agent 完成后 callback 又追加了 memory/cost/compaction 等 review
+           通知）→ 查 _completed_chat_for_message 拿到 chat_id，
+           把消息加入 _orphan_review_queue（按 chat_id 合并），
+           schedule 短延迟后调 on_background_deliver 包装成独立卡片推出去，
+           避免 fallback 走裸文本刷屏。
+        """
         if not self.enabled or not text or not callable(sender):
             return False
         session = self._get_active_session(message_id)
-        if session is None:
+        if session is not None:
+            with session.deferred_background_review_lock:
+                if session.deferred_background_review_closed:
+                    return False
+                session.deferred_background_reviews.append((text, sender))
+            return True
+        # 孤儿分支：session 已不可用。
+        chat_id = self._completed_chat_for_message.get(message_id)
+        if not chat_id:
             return False
-        with session.deferred_background_review_lock:
-            if session.deferred_background_review_closed:
-                return False
-            session.deferred_background_reviews.append((text, sender))
+        self._prune_completed_chat_map()
+        return self._enqueue_orphan_review(chat_id, text)
+
+    def _enqueue_orphan_review(self, chat_id: str, text: str) -> bool:
+        """孤儿 review 入队 + schedule 合并 flush."""
+        with self._orphan_review_lock:
+            queue = self._orphan_review_queue.setdefault(chat_id, [])
+            queue.append(text)
+            existing = self._orphan_review_timers.pop(chat_id, None)
+            if existing is not None:
+                try:
+                    existing.cancel()
+                except Exception:
+                    pass
+            loop = self._get_loop()
+            if loop is None or loop.is_closed():
+                # 无 event loop 可调度 — 同步 flush 兜底。
+                return self._flush_orphan_reviews_sync(chat_id)
+            try:
+                handle = loop.call_later(
+                    self._orphan_flush_delay_sec,
+                    self._flush_orphan_reviews_sync,
+                    chat_id,
+                )
+                self._orphan_review_timers[chat_id] = handle
+            except RuntimeError:
+                return self._flush_orphan_reviews_sync(chat_id)
         return True
+
+    def _enqueue_budget_exhausted_review(
+        self,
+        *,
+        session: Any,
+        answer: str,
+        context: dict | None,
+    ) -> bool:
+        """触顶场景:主动入队一条 synthetic review 走孤儿合并路径.
+
+        触发条件:context.turn_exit_reason 以 'max_iterations_reached' 开头。
+        此时 hermes 不会 schedule background review(因为 _should_review_memory
+        仍是 False),所以孤儿 review 队列永远不会被填充 → 用户只看到
+        'Iteration budget exhausted' 裸文本警告,没有任何事后提示。
+
+        主动入队后:
+        - 如果 hermes 后续 schedule memory review(10+ turns 时): 我们的 synthetic
+          review 会和真 review 合并,走 on_background_deliver 推一张合并卡片。
+        - 如果 hermes 不 schedule: 只有这条 synthetic review,也会走合并路径
+          推一张单条卡片(同样避免裸文本)。
+
+        必须在 session._cleanup 之前调用,因为依赖 session.chat_id。
+        """
+        if not self.enabled:
+            return False
+        if not context:
+            return False
+        turn_exit_reason = context.get("turn_exit_reason", "") or ""
+        if not turn_exit_reason.startswith("max_iterations_reached"):
+            return False
+        chat_id = getattr(session, "chat_id", None)
+        if not chat_id:
+            return False
+        api_calls = context.get("api_calls", "?")
+        max_iter = context.get("max_iterations", "?")
+        text = (
+            f"⚠️ Decision chain exhausted at {api_calls}/{max_iter} iterations.\n"
+            f"Summary delivered: {len(answer or '')} chars.\n"
+            f"Background review skipped — budget hit before review window."
+        )
+        ok = self._enqueue_orphan_review(chat_id, text)
+        if ok:
+            _logger.info(
+                "budget-exhausted review enqueued: chat=%s exit=%s",
+                chat_id[:12], turn_exit_reason,
+            )
+        return ok
+
+    def _flush_orphan_reviews_sync(self, chat_id: str) -> bool:
+        """同步入口：取 queue、清理 timer、起 async flush 任务."""
+        with self._orphan_review_lock:
+            self._orphan_review_timers.pop(chat_id, None)
+            pending = self._orphan_review_queue.pop(chat_id, [])
+        if not pending:
+            return True
+        loop = self._get_loop()
+        if loop is None or loop.is_closed():
+            _logger.warning(
+                "orphan reviews dropped: no event loop, chat=%s count=%d",
+                chat_id[:12], len(pending),
+            )
+            return False
+        try:
+            task = loop.create_task(self._do_flush_orphan_reviews(chat_id, pending))
+            task.add_done_callback(self._on_bg_task_done)
+        except RuntimeError:
+            _logger.warning(
+                "orphan reviews dropped: create_task failed, chat=%s count=%d",
+                chat_id[:12], len(pending),
+            )
+            return False
+        return True
+
+    async def _do_flush_orphan_reviews(self, chat_id: str, items: list[str]) -> None:
+        """合并孤儿 review，调 on_background_deliver 推独立卡片."""
+        if not self.enabled:
+            return
+        content = "\n".join(items).strip()
+        if not content or not chat_id:
+            return
+        preview = f"(decision chain exhausted · {len(items)} follow-up note{'s' if len(items) != 1 else ''})"
+        try:
+            await self._do_background_deliver(chat_id, preview, content)
+            _logger.info(
+                "orphan reviews flushed: chat=%s count=%d len=%d",
+                chat_id[:12], len(items), len(content),
+            )
+        except Exception:
+            _logger.warning(
+                "orphan reviews flush failed: chat=%s count=%d",
+                chat_id[:12], len(items), exc_info=True,
+            )
+
+    def _prune_completed_chat_map(self) -> None:
+        """清理过期的 message_id→chat_id 映射，避免内存泄漏."""
+        if not self._completed_chat_at:
+            return
+        now = time.time()
+        expired = [
+            k for k, t in self._completed_chat_at.items()
+            if now - t > self._orphan_chat_max_ttl_sec
+        ]
+        for k in expired:
+            self._completed_chat_at.pop(k, None)
+            self._completed_chat_for_message.pop(k, None)
 
     def _flush_deferred_background_reviews(self, session: CardSession) -> None:
         lock = getattr(session, "deferred_background_review_lock", None)
@@ -474,6 +742,16 @@ class StreamCardController(StreamingController):
         if session is None:
             return
         anchor = getattr(session, "anchor_id", None)
+        chat_id = getattr(session, "chat_id", None)
+        if chat_id:
+            # 保留 message_id→chat_id 映射，供 defer_background_review 在孤儿分支
+            # 复用（决策链耗尽/已终态的 session 已被清掉，但 background review
+            # 消息仍可能产生）。
+            now = time.time()
+            for key in (message_id, anchor):
+                if key and key not in self._completed_chat_for_message:
+                    self._completed_chat_for_message[key] = chat_id
+                    self._completed_chat_at[key] = now
         if anchor and self._sessions.get(anchor) is session:
             del self._sessions[anchor]
         stale_keys = [k for k, v in self._interrupt_map.items() if v == message_id]

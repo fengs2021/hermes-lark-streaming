@@ -263,3 +263,27 @@ async def on_background_deliver(
     except Exception as exc:
         _logger.warning("on_background_deliver error: %s", exc, exc_info=True)
         return False
+
+
+@_safe_hook(default_return=False, log_level="warning")
+def on_status_message(
+    *,
+    ctrl: Any,
+    chat_id: str,
+    event_type: str,
+    content: str,
+    metadata: dict[str, Any] | None = None,
+) -> bool:
+    """[注入点 12] status_callback — Compacting context / 触顶 / 系统通知.
+
+    推独立 CardKit 卡片到 chat，compaction 触发的 status 会先强制 finalize
+    当前 active session 让"截断自动完成整合面板"真正发生。
+    """
+    return bool(
+        ctrl.on_status_message(
+            chat_id=chat_id,
+            event_type=event_type,
+            content=content,
+            metadata=metadata,
+        )
+    )

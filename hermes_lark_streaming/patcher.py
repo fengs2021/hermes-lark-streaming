@@ -27,6 +27,7 @@ _HOOK_NAMES = [
     "ABORT",
     "INTERRUPT",
     "BG_DELIVER",
+    "STATUS_MESSAGE",
 ]
 MARKERS: list[tuple[str, str]] = [(f"# {PREFIX}_{n}_BEGIN", f"# {PREFIX}_{n}_END") for n in _HOOK_NAMES]
 
@@ -41,6 +42,7 @@ MK_BACKGROUND_REVIEW, MK_BACKGROUND_REVIEW_END = MARKERS[7]
 MK_ABORT, MK_ABORT_END = MARKERS[8]
 MK_INTERRUPT, MK_INTERRUPT_END = MARKERS[9]
 MK_BG_DELIVER, MK_BG_DELIVER_END = MARKERS[10]
+MK_STATUS_MESSAGE, MK_STATUS_MESSAGE_END = MARKERS[11]
 
 _BACKUP_SUFFIX = ".hermes_lark.bak"
 
@@ -116,6 +118,9 @@ def _complete_hook(indent: str) -> str:
             "        context={",
             "            'used_tokens': agent_result.get('last_prompt_tokens', 0),",
             "            'max_tokens': agent_result.get('context_length', 0),",
+            "            'turn_exit_reason': agent_result.get('turn_exit_reason', ''),",
+            "            'api_calls': agent_result.get('api_calls', 0),",
+            "            'max_iterations': agent_result.get('max_iterations', 0),",
             "        },",
             "    )",
             "    if _lark_card_sent:",
@@ -308,6 +313,32 @@ def _bg_deliver_hook(indent: str) -> str:
     )
 
 
+def _status_message_hook(indent: str) -> str:
+    return _make_hook(
+        indent,
+        MK_STATUS_MESSAGE,
+        MK_STATUS_MESSAGE_END,
+        [
+            "try:",
+            "    if source.platform.value.lower() in ('feishu', 'lark') and prepared_message:",
+            "        from hermes_lark_streaming.patch import on_status_message",
+            "        _lark_status_meta = (",
+            "            {'reply_to_message_id': _status_thread_metadata.get('reply_to_message_id')}",
+            "            if _status_thread_metadata else None",
+            "        )",
+            "        if on_status_message(",
+            "            chat_id=_status_chat_id,",
+            "            event_type=event_type,",
+            "            content=prepared_message,",
+            "            metadata=_lark_status_meta,",
+            "        ):",
+            "            return",
+            "except Exception:",
+            "    pass",
+        ],
+    )
+
+
 def _remove_block(content: str, begin: str, end: str) -> str:
     lines = content.splitlines(keepends=True)
     begin_idx = end_idx = None
@@ -473,6 +504,7 @@ class Patcher:
             ("reasoning", "reasoning", _find_reasoning_site(tree, lines)),
             ("background_review", "background_review", _find_background_review_site(tree, lines)),
             ("bg_deliver", "bg_deliver", _find_bg_deliver_site(tree, lines)),
+            ("status_message", "status_message", _find_status_message_site(tree, lines)),
         ]
 
         sites: list[tuple[int, str, str]] = []
@@ -495,6 +527,7 @@ class Patcher:
             "reasoning": _reasoning_hook,
             "background_review": _background_review_hook,
             "bg_deliver": _bg_deliver_hook,
+            "status_message": _status_message_hook,
         }
         for idx, indent, fn_name in sites:
             hook = _HOOK_FNS[fn_name](indent)
@@ -603,6 +636,16 @@ def _find_bg_deliver_site(tree: ast.Module, lines: list[str]) -> tuple[int, str]
     for i, line in enumerate(lines):
         if line.strip() == "images, text_content = adapter.extract_images(response)":
             return i + 1, _safe_indent(lines, i)
+    return None
+
+
+def _find_status_message_site(tree: ast.Module, lines: list[str]) -> tuple[int, str] | None:
+    for i, line in enumerate(lines):
+        if line.strip() == "def _status_callback_sync(event_type: str, message: str) -> None:":
+            # def 函数体需要 def 行缩进 + 4 空格
+            def_indent = _safe_indent(lines, i)
+            body_indent = def_indent + "    "
+            return i + 1, body_indent
     return None
 
 

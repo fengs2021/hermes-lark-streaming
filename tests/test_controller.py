@@ -1249,3 +1249,391 @@ class TestBackgroundDeliver:
         assert result is False
         mock_client.upload_image.assert_not_called()
         mock_client.send_card_to_chat.assert_not_called()
+
+
+# ── 决策链耗尽/已终态：孤儿 review 应走合并卡片而非裸文本 fallback ──
+
+
+class TestOrphanBackgroundReview:
+    """Bug: 决策链 90/90 耗尽后,agent 仍会发 background_review_callback
+    消息(💾 Memory updated / Cost / Compaction 等)。此时 session.state 已
+    COMPLETED,defer_background_review 走原路径会返回 False 触发裸文本
+    fallback 导致刷屏。修复后应按 chat_id 合并成单张独立卡片。"""
+
+    def _install_completed_chat(self, ctrl: StreamCardController, message_id: str, chat_id: str) -> None:
+        """模拟 _cleanup 已完成:把 message_id 记到 completed_chat_for_message。"""
+        ctrl._completed_chat_for_message[message_id] = chat_id
+        ctrl._completed_chat_at[message_id] = time.time()
+
+    @pytest.mark.asyncio
+    async def test_orphan_review_routes_to_background_deliver(self) -> None:
+        ctrl = _setup_ctrl()
+        chat_id = "chat_orphan_1"
+        self._install_completed_chat(ctrl, "msg_terminated", chat_id)
+        sent: list[str] = []
+
+        # 1. session 已不可用时 defer_background_review 仍应返回 True
+        assert ctrl.defer_background_review(
+            message_id="msg_terminated", text="💾 Memory updated", sender=sent.append,
+        )
+        # 2. 触发同步 flush(模拟合并窗口到点)
+        ctrl._flush_orphan_reviews_sync(chat_id)
+        # 3. 异步任务跑完后,_do_background_deliver 被调
+        await asyncio.sleep(0.05)
+        # 4. 孤儿 review 不应走 sender(裸文本)路径
+        assert sent == []
+        # 5. 应走 send_card_to_chat(走 on_background_deliver 包装)
+        ctrl._client.send_card_to_chat.assert_called_once()
+        call_args = ctrl._client.send_card_to_chat.call_args.args
+        assert call_args[0] == chat_id
+        # 第二个位置参数是 build_background_card 生成的 dict;
+        # 文本内容以某种方式嵌在 card 元素里(取决于 builder),
+        # 这里用宽松检查:card 是 dict 且非空
+        assert isinstance(call_args[1], dict) and call_args[1]
+
+    @pytest.mark.asyncio
+    async def test_orphan_review_merges_multiple_into_single_card(self) -> None:
+        """同一 chat_id 短时间内的多条孤儿 review 合并为 1 张卡片。"""
+        ctrl = _setup_ctrl()
+        chat_id = "chat_orphan_merge"
+        self._install_completed_chat(ctrl, "msg_terminated", chat_id)
+        sent: list[str] = []
+
+        # 连续推 3 条 review
+        for i in range(3):
+            assert ctrl.defer_background_review(
+                message_id="msg_terminated", text=f"line {i}", sender=sent.append,
+            )
+        # 合并窗口 0.6s 内只应触发 1 次 flush
+        ctrl._flush_orphan_reviews_sync(chat_id)
+        await asyncio.sleep(0.05)
+        assert sent == []  # 裸文本路径未走
+        ctrl._client.send_card_to_chat.assert_called_once()
+        # 验证:同 chat_id 3 条 review 应被合并为 1 张卡片(只调 1 次 send)
+        assert ctrl._client.send_card_to_chat.call_count == 1
+
+    def test_orphan_review_without_chat_mapping_returns_false(self) -> None:
+        """无 completed_chat 映射时(从未有过 session)返回 False — 走 fallback 兜底。"""
+        ctrl = _setup_ctrl()
+        sent: list[str] = []
+
+        # message_id 不在 _completed_chat_for_message,也不在 _sessions
+        assert not ctrl.defer_background_review(
+            message_id="msg_unknown", text="review", sender=sent.append,
+        )
+        assert sent == []
+        # 不应调度任何 flush
+        assert ctrl._orphan_review_queue == {}
+
+    @pytest.mark.asyncio
+    async def test_orphan_review_disabled_during_flush_skips(self) -> None:
+        """enabled=True 入队后,flush 前 controller 被 disabled,
+        _do_flush_orphan_reviews 内部 enabled 检查应跳过推卡片。"""
+        ctrl = _setup_ctrl()
+        chat_id = "chat_disabled_during"
+        self._install_completed_chat(ctrl, "msg_term", chat_id)
+        # 先入队(此时 enabled=True)
+        assert ctrl.defer_background_review(
+            message_id="msg_term", text="review", sender=lambda x: None,
+        )
+        # 模拟运行期间被 disable
+        ctrl._cfg._raw = {"streaming": {"enabled": False}, "feishu": {}}
+        # 触发 flush
+        ctrl._flush_orphan_reviews_sync(chat_id)
+        await asyncio.sleep(0.05)
+        ctrl._client.send_card_to_chat.assert_not_called()
+
+
+class TestBudgetExhaustedEnqueue:
+    """触顶场景:on_completed_wait 自动入队 review 走合并卡片路径。"""
+
+    def _setup_ctrl_with_session(self, message_id: str = "msg_budget"):
+        ctrl = _setup_ctrl()
+        chat_id = "chat_budget"
+        ctrl.on_message_started(message_id=message_id, chat_id=chat_id)
+        # 标记 session 有卡 + state 正常
+        sess = ctrl._sessions[message_id]
+        sess.set_card(card_id="mock_card", card_msg_id="mock_msg")
+        sess.state = SessionState.STREAMING
+        # 替换 _complete_session_wait 避免走真实 finalize
+        async def _fake_complete(s):
+            return True
+        ctrl._complete_session_wait = _fake_complete
+        return ctrl, chat_id, sess
+
+    @pytest.mark.asyncio
+    async def test_max_iterations_enqueues_synthetic_review(self) -> None:
+        """context.turn_exit_reason='max_iterations_reached(5/5)' → 入队 review。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session()
+
+        # mock send_card_to_chat 防止 on_background_deliver 真发
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        # 先 await on_completed_wait
+        result = await ctrl.on_completed_wait(
+            message_id="msg_budget",
+            answer="summary text" * 50,
+            duration=70.9,
+            model="deepseek-v4-flash-free",
+            tokens={"input_tokens": 100, "output_tokens": 50},
+            context={
+                "turn_exit_reason": "max_iterations_reached(5/5)",
+                "api_calls": 5,
+                "max_iterations": 5,
+            },
+        )
+        assert result is True
+
+        # 同步入队后 queue 应有 1 条 review
+        # 0.6s 合并窗口尚未到期,chat_id 应在 queue 里
+        assert chat_id in ctrl._orphan_review_queue
+        assert len(ctrl._orphan_review_queue[chat_id]) == 1
+
+        # 等合并窗口 0.6s + flush
+        await asyncio.sleep(0.8)
+
+        # flush 后 queue 被弹出
+        assert chat_id not in ctrl._orphan_review_queue
+        ctrl._client.send_card_to_chat.assert_called_once()
+        call = ctrl._client.send_card_to_chat.call_args
+        card = call.args[1]
+        import json
+        card_text = json.dumps(card, ensure_ascii=False)
+        assert "Decision chain exhausted" in card_text
+        assert "5/5" in card_text
+        assert "Background review skipped" in card_text
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_does_not_enqueue(self) -> None:
+        """正常完成(turn_exit_reason='text_response') → 不入队 review。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session()
+
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        result = await ctrl.on_completed_wait(
+            message_id="msg_normal",
+            answer="normal answer",
+            duration=10.0,
+            model="deepseek-v4-flash-free",
+            tokens={"input_tokens": 50, "output_tokens": 30},
+            context={
+                "turn_exit_reason": "text_response(finish_reason=stop)",
+                "api_calls": 3,
+                "max_iterations": 90,
+            },
+        )
+        assert result is True
+
+        await asyncio.sleep(0.8)
+
+        # 不应入队任何 review
+        assert ctrl._orphan_review_queue.get(chat_id, []) == []
+        ctrl._client.send_card_to_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_without_context_does_not_enqueue(self) -> None:
+        """无 context 时(老版本 patcher 没透传)→ 安全降级,不入队。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session()
+
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        result = await ctrl.on_completed_wait(
+            message_id="msg_no_ctx",
+            answer="summary",
+            duration=10.0,
+            model="deepseek-v4-flash-free",
+            tokens=None,
+            context=None,
+        )
+        assert result is True
+
+        await asyncio.sleep(0.8)
+        assert ctrl._orphan_review_queue.get(chat_id, []) == []
+        ctrl._client.send_card_to_chat.assert_not_called()
+    @pytest.mark.asyncio
+    async def test_max_iterations_enqueues_synthetic_review(self) -> None:
+        """context.turn_exit_reason='max_iterations_reached(5/5)' → 入队 review。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session("msg_budget")
+
+        # mock send_card_to_chat 防止 on_background_deliver 真发
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        result = await ctrl.on_completed_wait(
+            message_id="msg_budget",
+            answer="summary text" * 50,
+            duration=70.9,
+            model="deepseek-v4-flash-free",
+            tokens={"input_tokens": 100, "output_tokens": 50},
+            context={
+                "turn_exit_reason": "max_iterations_reached(5/5)",
+                "api_calls": 5,
+                "max_iterations": 5,
+            },
+        )
+        assert result is True
+
+        # 同步入队后(合并窗口未到期)queue 应有 1 条 review
+        assert chat_id in ctrl._orphan_review_queue
+        assert len(ctrl._orphan_review_queue[chat_id]) == 1
+
+        # 等合并窗口 0.6s + flush
+        await asyncio.sleep(0.8)
+
+        # flush 后 queue 被弹出
+        assert chat_id not in ctrl._orphan_review_queue
+        ctrl._client.send_card_to_chat.assert_called_once()
+        call = ctrl._client.send_card_to_chat.call_args
+        card = call.args[1]
+        import json
+        card_text = json.dumps(card, ensure_ascii=False)
+        assert "Decision chain exhausted" in card_text
+        assert "5/5" in card_text
+        assert "Background review skipped" in card_text
+
+    @pytest.mark.asyncio
+    async def test_normal_completion_does_not_enqueue(self) -> None:
+        """正常完成(turn_exit_reason='text_response') → 不入队 review。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session("msg_normal")
+
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        result = await ctrl.on_completed_wait(
+            message_id="msg_normal",
+            answer="normal answer",
+            duration=10.0,
+            model="deepseek-v4-flash-free",
+            tokens={"input_tokens": 50, "output_tokens": 30},
+            context={
+                "turn_exit_reason": "text_response(finish_reason=stop)",
+                "api_calls": 3,
+                "max_iterations": 90,
+            },
+        )
+        assert result is True
+
+        await asyncio.sleep(0.8)
+
+        # 不应入队任何 review
+        assert ctrl._orphan_review_queue.get(chat_id, []) == []
+        ctrl._client.send_card_to_chat.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_without_context_does_not_enqueue(self) -> None:
+        """无 context 时(老版本 patcher 没透传)→ 安全降级,不入队。"""
+        ctrl, chat_id, sess = self._setup_ctrl_with_session("msg_no_ctx")
+
+        ctrl._client.send_card_to_chat = AsyncMock(return_value="mock_msg")
+
+        result = await ctrl.on_completed_wait(
+            message_id="msg_no_ctx",
+            answer="summary",
+            duration=10.0,
+            model="deepseek-v4-flash-free",
+            tokens=None,
+            context=None,
+        )
+        assert result is True
+
+        await asyncio.sleep(0.8)
+        assert ctrl._orphan_review_queue.get(chat_id, []) == []
+        ctrl._client.send_card_to_chat.assert_not_called()
+
+
+class TestOnStatusMessage:
+    def test_returns_false_when_disabled(self) -> None:
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = False
+        assert ctrl.on_status_message(chat_id="c1", event_type="lifecycle", content="🗜️ Compacting context...") is False
+
+    def test_returns_false_on_empty_content(self) -> None:
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+        assert ctrl.on_status_message(chat_id="c1", event_type="lifecycle", content="") is False
+
+    def test_sends_status_card_on_success(self) -> None:
+        import threading
+
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+
+        mock_client = AsyncMock()
+        mock_client.send_card_to_chat.return_value = "msg_123"
+        ctrl._client = mock_client
+        ctrl._initialized = True
+
+        loop = asyncio.new_event_loop()
+        ctrl._loop = loop
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        try:
+            result = ctrl.on_status_message(
+                chat_id="c1",
+                event_type="lifecycle",
+                content="🗜️ Compacting context — summarizing...",
+            )
+            assert result is True
+            mock_client.send_card_to_chat.assert_called_once()
+            args = mock_client.send_card_to_chat.call_args[0]
+            assert args[0] == "c1"
+            card = args[1]
+            assert card["schema"] == "2.0"
+            assert card["header"]["title"]["content"].startswith("ℹ️")
+            assert "Compacting" in card["body"]["elements"][0]["content"]
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+
+    def test_warn_header_for_warning_event(self) -> None:
+        import threading
+
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+
+        mock_client = AsyncMock()
+        mock_client.send_card_to_chat.return_value = "msg_warn"
+        ctrl._client = mock_client
+        ctrl._initialized = True
+
+        loop = asyncio.new_event_loop()
+        ctrl._loop = loop
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        try:
+            result = ctrl.on_status_message(
+                chat_id="c1",
+                event_type="warn",
+                content="⚠️ Iteration budget exhausted (5/5) — asking model to summarise",
+            )
+            assert result is True
+            card = mock_client.send_card_to_chat.call_args[0][1]
+            assert card["header"]["title"]["content"].startswith("⚠️")
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+
+    def test_no_active_session_is_safe(self) -> None:
+        """compaction 触发时 _sessions 为空(已被 prune)→ 不崩,只发独立卡片。"""
+        import threading
+
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+
+        mock_client = AsyncMock()
+        mock_client.send_card_to_chat.return_value = "msg_xxx"
+        ctrl._client = mock_client
+        ctrl._initialized = True
+
+        loop = asyncio.new_event_loop()
+        ctrl._loop = loop
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        try:
+            result = ctrl.on_status_message(
+                chat_id="c1",
+                event_type="lifecycle",
+                content="🗜️ Compacting context...",
+            )
+            assert result is True
+            mock_client.send_card_to_chat.assert_called_once()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)

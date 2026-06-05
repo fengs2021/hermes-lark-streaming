@@ -644,6 +644,35 @@ def build_cron_card(content: str) -> dict[str, Any]:
     return card
 
 
+_STATUS_HEADER_MAP = {
+    "lifecycle": "ℹ️ Status",
+    "warn": "⚠️ Warning",
+    "info": "ℹ️ Info",
+}
+
+
+def build_status_card(event_type: str, content: str) -> dict[str, Any]:
+    """状态消息推送卡片 (compaction / 触顶 / 系统通知) — schema 2.0, header + markdown."""
+    title = _STATUS_HEADER_MAP.get(event_type, f"📣 {event_type}")
+    card: dict[str, Any] = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True, "locales": _LOCALES},
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+        },
+        "body": {"elements": []},
+    }
+    if not content.strip():
+        return card
+    summary = content[:120].replace("\n", " ").replace("```", "").strip()
+    if summary:
+        card["config"]["summary"] = {"content": summary}
+    for chunk in _split_long_text(optimize_markdown_style(content)):
+        if chunk.strip():
+            card["body"]["elements"].append({"tag": "markdown", "content": chunk})
+    return card
+
+
 def build_background_card(preview: str, content: str) -> dict[str, Any]:
     """Background 任务完成推送卡片 — schema 2.0，header + markdown."""
     card: dict[str, Any] = {
