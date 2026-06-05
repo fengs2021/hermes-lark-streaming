@@ -455,6 +455,41 @@ class StreamCardController(StreamingController):
         }
         return await self._complete_session_wait(session)
 
+    async def try_finalize_all_by_chat(
+        self,
+        *,
+        chat_id: str,
+    ) -> int:
+        """Turn end 兑底: 找同 chat 所有 _非_ terminal session, 全部 finalize.
+
+        场景: on_completed_wait 失败 + try_finalize_by_chat 仍失败时, 表明
+        answer 所在 session 找不到且 _chat 范围内_ 也没最近的可用 session。
+        此时仍有 _同 chat 但未 finalized_ 的早期 session(被多次切走/过其窗口)
+        遺留在 _sessions dict,需兑底全部加 footer,避免用户看到"半成品卡堆积"。
+
+        返回成功 finalize 的 session 数。
+        """
+        if not self.enabled or not chat_id:
+            return 0
+        candidates = [
+            s for s in self._sessions.values()
+            if s.chat_id == chat_id
+            and s.card_id
+            and not s.state.is_terminal
+        ]
+        success = 0
+        for session in candidates:
+            if not session.footer:
+                session.footer = {
+                    "duration": 0.0,
+                    "model": "completed-no-footer",
+                    "completed_no_footer": True,
+                }
+            ok = await self._complete_session_wait(session)
+            if ok:
+                success += 1
+        return success
+
     def on_cron_deliver(
         self,
         *,

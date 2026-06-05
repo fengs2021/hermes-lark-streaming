@@ -15,6 +15,7 @@ _T: dict[str, tuple[str, str]] = {
     "status_completed": ("✅ Completed", "✅ 已完成"),
     "status_error": ("❌ Error", "❌ 出错"),
     "status_stopped": ("🛑 Stopped", "🛑 已停止"),
+    "status_interrupted": ("⚠️ Interrupted · continued below", "⚠️ 任务拆分 · 下条继续"),
     "elapsed": ("Elapsed {}", "耗时 {}"),
     "context": ("Context {}", "上下文 {}"),
     "processing": ("Processing...", "处理中..."),

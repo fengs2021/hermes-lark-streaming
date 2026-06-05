@@ -132,8 +132,10 @@ async def on_message_completed_wait(
 ) -> bool:
     """[注入点 2] return 前 — message.completed，等待卡片完成收尾.
 
-    失败 fallback: 如果同 chat 有可 finalize 的 session, 调 try_finalize_by_chat
-    追加 answer 到原卡, 避免 gateway 走 text fallback 发裸 post。
+    失败 fallback 链:
+    1. try_finalize_by_chat — 同 chat 最近 session 追加 answer
+    2. try_finalize_all_by_chat — 同 chat 所有未 finalized session 兑底
+       (避免多次 compaction 后早期 session 仍半成品遗留在 chat)
     """
     ok = bool(
         await ctrl.on_completed_wait(
@@ -145,11 +147,15 @@ async def on_message_completed_wait(
             context=context,
         )
     )
+    # 不论 on_completed_wait 成不成功, 都扫一遍同 chat 的未 finalized session
+    # (超长任务多次切 session 后, 早期 session 仍遗留在 _sessions dict)
+    if chat_id:
+        await ctrl.try_finalize_all_by_chat(chat_id=chat_id)
     if ok:
         return True
     if not chat_id:
         return False
-    return bool(
+    ok = bool(
         await ctrl.try_finalize_by_chat(
             chat_id=chat_id,
             answer=answer,
@@ -159,6 +165,11 @@ async def on_message_completed_wait(
             context=context,
         )
     )
+    if ok:
+        return True
+    # 兑底: 同 chat 所有未 finalized session(上面已调过一次,这里仅作安全网)
+    finalized = await ctrl.try_finalize_all_by_chat(chat_id=chat_id)
+    return finalized > 0
 
 
 @_safe_hook(default_return=False)

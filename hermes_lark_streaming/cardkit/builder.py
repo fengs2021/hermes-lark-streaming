@@ -75,6 +75,7 @@ _HEADER_STATES: dict[str, dict[str, str]] = {
     "completed": {"template": "green", "i18n_key": "status_completed"},
     "error": {"template": "red", "i18n_key": "status_error"},
     "stopped": {"template": "red", "i18n_key": "status_stopped"},
+    "interrupted": {"template": "orange", "i18n_key": "status_interrupted"},
 }
 
 
@@ -622,6 +623,10 @@ def build_complete_card(
     card["body"] = {"elements": elements}
     if header_enabled:
         header_status = "error" if is_error else "stopped" if is_aborted else "completed"
+        if not is_error and not is_aborted and (footer_data or {}).get("interrupted"):
+            header_status = "interrupted"
+        elif not is_error and not is_aborted and (footer_data or {}).get("completed_no_footer"):
+            header_status = "stopped"
         card["header"] = _build_header(header_status)
     return card
 

@@ -1656,3 +1656,30 @@ class TestTryFinalizeByChat:
         import asyncio
         result = asyncio.run(ctrl.try_finalize_by_chat(chat_id="c1", answer="hi"))
         assert result is False
+
+
+class TestTryFinalizeAllByChat:
+    def test_disabled_returns_zero(self) -> None:
+        import asyncio
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = False
+        result = asyncio.run(ctrl.try_finalize_all_by_chat(chat_id="c1"))
+        assert result == 0
+
+    def test_no_chat_id_returns_zero(self) -> None:
+        import asyncio
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+        result = asyncio.run(ctrl.try_finalize_all_by_chat(chat_id=""))
+        assert result == 0
+
+    def test_no_sessions_returns_zero(self) -> None:
+        import asyncio
+        ctrl = StreamCardController()
+        ctrl._cfg = MagicMock()
+        ctrl._cfg.enabled = True
+        ctrl._sessions = {}
+        result = asyncio.run(ctrl.try_finalize_all_by_chat(chat_id="c1"))
+        assert result == 0
